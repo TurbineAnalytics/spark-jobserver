@@ -196,7 +196,7 @@ lazy val dockerSettings = Seq(
     }
   },
   imageNames in docker := Seq(
-    sbtdocker.ImageName(namespace = Some("addmeaning"),
+    sbtdocker.ImageName(namespace = Some("turbineanalytics"),
       repository = "spark-jobserver",
       tag = Some(
         s"${version.value}" +
