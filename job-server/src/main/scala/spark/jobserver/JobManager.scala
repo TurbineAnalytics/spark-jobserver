@@ -61,10 +61,13 @@ object JobManager {
                   .withoutPath("akka.remote.netty.tcp.port")
                   .withValue("akka.remote.netty.tcp.port", ConfigValueFactory.fromAnyRef(0))
     } else {
-      systemConfig
+      systemConfig.resolve()
     }
 
-    val system = makeSystem(config.resolve())
+    logger.info("Starting JobManager named " + managerName + " with config {}",
+      config.getConfig("spark").root.render())
+
+    val system = makeSystem(config)
     val clazz = Class.forName(config.getString("spark.jobserver.jobdao"))
     val ctor = clazz.getDeclaredConstructor(Class.forName("com.typesafe.config.Config"))
     val jobDAO = ctor.newInstance(config).asInstanceOf[JobDAO]
