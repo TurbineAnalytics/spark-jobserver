@@ -1,3 +1,13 @@
+<!-- START doctoc generated TOC please keep comment here to allow auto update -->
+<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
+**Table of Contents**  *generated with [DocToc](https://github.com/thlorenz/doctoc)*
+
+- [Configuring Job Server for Mesos](#configuring-job-server-for-mesos)
+  - [Mesos client mode](#mesos-client-mode)
+  - [Mesos cluster mode](#mesos-cluster-mode)
+
+<!-- END doctoc generated TOC please keep comment here to allow auto update -->
+
 ## Configuring Job Server for Mesos
 
 See also running on [cluster](cluster.md), YARN in [client mode](yarn.md) and running on [EMR](EMR.md).
@@ -27,6 +37,7 @@ Add the following config to you job-server config file:
 - set `spark.jobserver.context-per-jvm` to `true`
 - set `akka.remote.netty.tcp.hostname` to the cluster interface of the host running the frontend
 - set `akka.remote.netty.tcp.maximum-frame-size` to support big remote jars fetch
+- set `spark.jobserver.network-address-resolver` to a suitable value according to your environment. `akka` is recommended.
 
 Example job server config (replace `CLUSTER-IP` with the internal IP of the host running the job server frontend):
 
@@ -71,3 +82,7 @@ MANAGER_LOGGING_OPTS="-Dlog4j.configuration=log4j-cluster.properties"
     ```
     REMOTE_JOBSERVER_DIR=<path to job-server directory> # copy of job-server directory on all mesos agent nodes 
     ```
+
+## Configuring Job Server for supervised cluster mode
+
+* See the [supervise-mode document](https://github.com/spark-jobserver/spark-jobserver/blob/master/doc/supervise-mode.md)
