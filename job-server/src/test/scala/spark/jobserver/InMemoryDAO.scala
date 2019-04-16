@@ -4,7 +4,7 @@ import java.io.{BufferedOutputStream, FileOutputStream}
 
 import com.typesafe.config.Config
 import org.joda.time.DateTime
-import spark.jobserver.io.{BinaryType, JobDAO, JobInfo, JobStatus}
+import spark.jobserver.io.{BinaryType, ContextInfo, JobDAO, JobInfo, JobStatus}
 
 import scala.collection.mutable
 import scala.concurrent.ExecutionContext.Implicits.global
@@ -33,7 +33,7 @@ class InMemoryDAO extends JobDAO {
     }
   }
 
-  override def retrieveBinaryFile(appName: String, binaryType: BinaryType, uploadTime: DateTime): String = {
+  override def getBinaryFilePath(appName: String, binaryType: BinaryType, uploadTime: DateTime): String = {
     // Write the jar bytes to a temporary file
     val outFile = java.io.File.createTempFile("InMemoryDAO", s".${binaryType.extension}")
     outFile.deleteOnExit()
@@ -44,6 +44,40 @@ class InMemoryDAO extends JobDAO {
       bos.close()
     }
     outFile.getAbsolutePath
+  }
+
+  val contextInfos = mutable.HashMap.empty[String, ContextInfo]
+
+  override def saveContextInfo(contextInfo: ContextInfo): Unit = {
+    contextInfos(contextInfo.id) = contextInfo
+  }
+
+  override def getContextInfo(id: String): Future[Option[ContextInfo]] = Future {
+    contextInfos.get(id)
+  }
+
+  private def sortTime(c1: ContextInfo, c2: ContextInfo): Boolean = {
+      // If both dates are the same then it will return false
+      c1.startTime.isAfter(c2.startTime)
+  }
+
+  override def getContextInfos(limit: Option[Int] = None, statuses: Option[Seq[String]] = None):
+        Future[Seq[ContextInfo]] = Future {
+    val allContexts = contextInfos.values.toSeq.sortWith(sortTime)
+    val filteredContexts = statuses match {
+      case Some(statuses) =>
+        allContexts.filter(j => statuses.contains(j.state))
+      case _ => allContexts
+    }
+
+    limit match {
+      case Some(l) => filteredContexts.take(l)
+      case _ => filteredContexts
+    }
+  }
+
+  override def getContextInfoByName(name: String): Future[Option[ContextInfo]] = Future {
+    contextInfos.values.toSeq.sortWith(sortTime).filter(_.name == name).headOption
   }
 
   val jobInfos = mutable.HashMap.empty[String, JobInfo]
@@ -65,8 +99,14 @@ class InMemoryDAO extends JobDAO {
     filterJobs.take(limit)
   }
 
-  override def getRunningJobInfosForContextName(contextName: String): Future[Seq[JobInfo]] = Future {
-    jobInfos.values.toSeq.filter(j => j.endTime.isEmpty && j.error.isEmpty && j.contextName == contextName)
+  override def getJobInfosByContextId(
+      contextId: String, jobStatuses: Option[Seq[String]] = None): Future[Seq[JobInfo]] = Future {
+    jobInfos.values.toSeq.filter(j => {
+      (contextId, jobStatuses) match {
+        case (contextId, Some(statuses)) => contextId == j.contextId && statuses.contains(j.state)
+        case _ => contextId == j.contextId
+      }
+    })
   }
 
   override def getJobInfo(jobId: String): Future[Option[JobInfo]] = Future {

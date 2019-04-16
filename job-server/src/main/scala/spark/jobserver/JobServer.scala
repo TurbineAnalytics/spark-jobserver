@@ -1,18 +1,26 @@
 package spark.jobserver
 
-import akka.actor.{ActorSystem, ActorRef}
-import akka.actor.Props
+import akka.actor.{ActorContext, ActorNotFound, ActorRef, ActorSystem, AddressFromURIString, Props}
+import akka.util.Timeout
 import akka.pattern.ask
-import com.typesafe.config.{ConfigValueFactory, Config, ConfigFactory}
+import akka.cluster.Cluster
+import akka.cluster.ClusterEvent.{InitialStateAsEvents, MemberEvent}
+import com.typesafe.config.{Config, ConfigFactory, ConfigValueFactory}
 
 import java.io.File
-import spark.jobserver.io.{BinaryType, JobDAOActor, JobDAO, DataFileDAO}
+import java.util.concurrent.{TimeUnit, TimeoutException}
+
+import spark.jobserver.io._
+import spark.jobserver.util.ContextReconnectFailedException
+import org.joda.time.DateTime
 import org.slf4j.LoggerFactory
 
 import scala.collection.JavaConverters._
-import scala.concurrent.{Await, ExecutionContext}
+import scala.concurrent.Await
 import scala.concurrent.duration._
-import scala.util.Try
+import scala.util.{Failure, Success, Try}
+import scala.collection.mutable.ListBuffer
+import com.google.common.annotations.VisibleForTesting
 
 /**
  * The Spark Job Server is a web service that allows users to submit and run Spark jobs, check status,
@@ -32,6 +40,7 @@ import scala.util.Try
  */
 object JobServer {
   val logger = LoggerFactory.getLogger(getClass)
+  implicit val ec = scala.concurrent.ExecutionContext.Implicits.global
 
   class InvalidConfiguration(error: String) extends RuntimeException(error)
 
@@ -59,6 +68,8 @@ object JobServer {
     val driverMode = config.getString("spark.submit.deployMode")
     val contextPerJvm = config.getBoolean("spark.jobserver.context-per-jvm")
     val jobDaoClass = Class.forName(config.getString("spark.jobserver.jobdao"))
+    val superviseModeEnabled = config.getBoolean("spark.driver.supervise")
+    val akkaTcpPort = config.getInt("akka.remote.netty.tcp.port")
 
     // ensure context-per-jvm is enabled
     if (sparkMaster.startsWith("yarn") && !contextPerJvm) {
@@ -68,6 +79,9 @@ object JobServer {
     } else if (driverMode == "cluster" && !contextPerJvm) {
       throw new InvalidConfiguration("Cluster mode requires context-per-jvm")
     }
+
+    // TODO: This should be removed once auto-discovery is introduced in SJS
+    checkIfAkkaTcpPortSpecifiedForSuperviseMode(driverMode, superviseModeEnabled, akkaTcpPort)
 
     // Check if we are using correct DB backend when context-per-jvm is enabled.
     // JobFileDAO and H2 mem is not supported.
@@ -104,22 +118,124 @@ object JobServer {
     val dataFileDAO = new DataFileDAO(config)
     val dataManager = system.actorOf(Props(classOf[DataManagerActor], dataFileDAO), "data-manager")
     val binManager = system.actorOf(Props(classOf[BinaryManager], daoActor), "binary-manager")
-    val supervisor =
-      system.actorOf(Props(
-        if (contextPerJvm) {
-          classOf[AkkaClusterSupervisorActor]
-        } else {
-          classOf[LocalContextSupervisorActor]
-        },
-        daoActor, dataManager), "context-supervisor")
-    val jobInfo = system.actorOf(Props(classOf[JobInfoActor], jobDAO, supervisor), "job-info")
 
     // Add initial job JARs, if specified in configuration.
     storeInitialBinaries(config, binManager)
 
-    // Create initial contexts
-    supervisor ! ContextSupervisor.AddContextsFromConfig
-    new WebApi(system, config, port, binManager, dataManager, supervisor, jobInfo).start()
+    val webApiPF = new WebApi(system, config, port, binManager, dataManager, _: ActorRef, _: ActorRef)
+    contextPerJvm match {
+      case false =>
+        val supervisor = system.actorOf(Props(classOf[LocalContextSupervisorActor],
+            daoActor, dataManager), AkkaClusterSupervisorActor.ACTOR_NAME)
+        supervisor ! ContextSupervisor.AddContextsFromConfig  // Create initial contexts
+        startWebApi(system, supervisor, jobDAO, webApiPF)
+      case true =>
+        val cluster = Cluster(system)
+
+        // Check if all contexts marked as running are still available and get the ActorRefs
+        val existingManagerActorRefs = getExistingManagerActorRefs(system, daoActor)
+        joinAkkaCluster(cluster, existingManagerActorRefs.headOption)
+        // We don't want to read all the old events that happened in the cluster
+        // So, we remove the initialStateMode parameter
+        cluster.registerOnMemberUp {
+          val supervisor = system.actorOf(Props(classOf[AkkaClusterSupervisorActor],
+            daoActor, dataManager, cluster), "context-supervisor")
+
+          logger.info("Subscribing to MemberUp event")
+          cluster.subscribe(supervisor, classOf[MemberEvent])
+
+          if (existingManagerActorRefs.length > 0) {
+            supervisor ! ContextSupervisor.RegainWatchOnExistingContexts(existingManagerActorRefs)
+          }
+
+          supervisor ! ContextSupervisor.AddContextsFromConfig  // Create initial contexts
+          startWebApi(system, supervisor, jobDAO, webApiPF)
+        }
+    }
+  }
+
+  def startWebApi(system: ActorSystem, supervisor: ActorRef, jobDAO: JobDAO,
+      webApiPF: (ActorRef, ActorRef) => WebApi) {
+    val jobInfo = system.actorOf(Props(classOf[JobInfoActor], jobDAO, supervisor), "job-info")
+    webApiPF(supervisor, jobInfo).start()
+  }
+
+  private def joinAkkaCluster(cluster: Cluster, initialSeedNode: Option[ActorRef]) {
+    initialSeedNode match {
+      case None =>
+        val selfAddress = cluster.selfAddress
+        logger.info(s"Joining newly created cluster at ${selfAddress}")
+        cluster.join(selfAddress)
+      case Some(actorRef) =>
+        logger.info(s"Joining existing cluster at ${actorRef.path.address.toString}")
+        cluster.join(actorRef.path.address)
+    }
+  }
+
+  @VisibleForTesting
+  def getManagerActorRef(contextInfo: ContextInfo, system: ActorSystem): Option[ActorRef] = {
+    val duration = FiniteDuration(3, SECONDS)
+    val clusterAddress = contextInfo.actorAddress.getOrElse(return None)
+    val address = clusterAddress + "/user/" + AkkaClusterSupervisorActor.MANAGER_ACTOR_PREFIX +
+        contextInfo.id
+    try {
+      val actorResolveFuture = system.actorSelection(address).resolveOne(duration)
+      val resolvedActorRef = Await.result(actorResolveFuture, duration)
+      logger.info(s"Found context ${contextInfo.name} -> reconnect is possible")
+      Some(resolvedActorRef)
+    } catch {
+      case ex @ (_: ActorNotFound | _: TimeoutException | _: InterruptedException) =>
+        logger.error(s"Failed to resolve actor reference for context ${contextInfo.name}", ex.getMessage)
+        None
+      case ex: Exception =>
+        logger.error("Unexpected exception occurred", ex)
+        None
+    }
+  }
+
+  @VisibleForTesting
+  def setReconnectionFailedForContextAndJobs(contextInfo: ContextInfo,
+      jobDaoActor: ActorRef) {
+    val finiteDuration = FiniteDuration(3, SECONDS)
+    val ctxName = contextInfo.name
+    val logMsg = s"Reconnecting to context $ctxName failed ->" +
+      s"updating status of context $ctxName and related jobs to error"
+    logger.info(logMsg)
+    val updatedContextInfo = contextInfo.copy(endTime = Option(DateTime.now()),
+        state = ContextStatus.Error, error = Some(ContextReconnectFailedException()))
+    jobDaoActor ! JobDAOActor.SaveContextInfo(updatedContextInfo)
+    (jobDaoActor ? JobDAOActor.GetJobInfosByContextId(
+        contextInfo.id, Some(JobStatus.getNonFinalStates())))(finiteDuration).onComplete {
+      case Success(JobDAOActor.JobInfos(jobInfos)) =>
+        jobInfos.foreach(jobInfo => {
+        jobDaoActor ! JobDAOActor.SaveJobInfo(jobInfo.copy(state = JobStatus.Error,
+            endTime = Some(DateTime.now()), error = Some(ErrorData(ContextReconnectFailedException()))))
+        })
+      case Failure(e: Exception) =>
+        logger.error(s"Exception occurred while fetching jobs for context (${contextInfo.id})", e)
+      case unexpectedMsg @ _ =>
+        logger.error(
+            s"$unexpectedMsg message received while fetching jobs for context (${contextInfo.id})")
+    }
+  }
+
+  @VisibleForTesting
+  def getExistingManagerActorRefs(system: ActorSystem, jobDaoActor: ActorRef): List[ActorRef] = {
+    val validManagerRefs = new ListBuffer[ActorRef]()
+    val config = system.settings.config
+    val daoAskTimeout = Timeout(config.getDuration("spark.jobserver.dao-timeout", TimeUnit.SECONDS).second)
+    val resp = Await.result(
+        (jobDaoActor ? JobDAOActor.GetContextInfos(None, Some(
+          Seq(ContextStatus.Running, ContextStatus.Stopping))))(daoAskTimeout).
+        mapTo[JobDAOActor.ContextInfos], daoAskTimeout.duration)
+
+    resp.contextInfos.map{ contextInfo =>
+      getManagerActorRef(contextInfo, system) match {
+        case None => setReconnectionFailedForContextAndJobs(contextInfo, jobDaoActor)
+        case Some(actorRef) => validManagerRefs += actorRef
+      }
+    }
+    validManagerRefs.toList
   }
 
   private def parseInitialBinaryConfig(key: String, config: Config): Map[String, String] = {
@@ -175,6 +291,13 @@ object JobServer {
           sys.error(s"Failed to store initial binaries: ${ex.getMessage}")
         case _ =>
       }
+    }
+  }
+
+  private def checkIfAkkaTcpPortSpecifiedForSuperviseMode(driverMode: String,
+      superviseModeEnabled: Boolean, akkaTcpPort: Int) {
+    if (driverMode == "cluster" && superviseModeEnabled == true && akkaTcpPort == 0) {
+      throw new InvalidConfiguration("Supervise mode requires akka.remote.netty.tcp.port to be hardcoded")
     }
   }
 

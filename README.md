@@ -69,7 +69,7 @@ Also see [Chinese docs / 中文](doc/chinese/job-server.md).
 
 (Please add yourself to this list!)
 
-Spark Job Server is now included in Datastax Enterprise 4.8!
+Spark Job Server is included in Datastax Enterprise!
 
 - [Ooyala](http://www.ooyala.com)
 - [Netflix](http://www.netflix.com)
@@ -108,6 +108,7 @@ Spark Job Server is now included in Datastax Enterprise 4.8!
 - Job and jar info is persisted via a pluggable DAO interface
 - Named Objects (such as RDDs or DataFrames) to cache and retrieve RDDs or DataFrames by name, improving object sharing and reuse among jobs.
 - Supports Scala 2.10 and 2.11
+- Support for supervise mode of Spark (EXPERIMENTAL)
 
 ## Version Information
 
@@ -124,7 +125,7 @@ Spark Job Server is now included in Datastax Enterprise 4.8!
 | 0.6.2       | 1.6.1         |
 | 0.7.0       | 1.6.2         |
 | 0.8.0       | 2.2.0    |
-| 0.8.1-SNAPSHOT | 2.2.0 |
+| 0.9.0-SNAPSHOT | 2.3.2 |
 
 For release notes, look in the `notes/` directory.
 
@@ -180,7 +181,7 @@ Then go ahead and start the job server using the instructions above.
 
 Let's upload the jar:
 
-    curl --data-binary @job-server-tests/target/scala-2.10/job-server-tests-$VER.jar localhost:8090/jars/test
+    curl -X POST localhost:8090/binaries/test -H "Content-Type: application/java-archive" --data-binary @job-server-tests/target/scala-2.10/job-server-tests-$VER.jar
     OK⏎
 
 #### Ad-hoc Mode - Single, Unrelated Jobs (Transient Context)
@@ -353,7 +354,7 @@ object WordCountExampleNewApi extends NewSparkJob {
 }
 ```
 
-It is much more type safe, separates context configuration, job ID, named objects, and other environment variables into a separate JobEnvironment input, and allows the validation method to return specific data for the runJob method.  See the [WordCountExample](job-server-tests/src/spark.jobserver/WordCountExample.scala) and [LongPiJob](job-server-tests/src/spark.jobserver/LongPiJob.scala) for examples.
+It is much more type safe, separates context configuration, job ID, named objects, and other environment variables into a separate JobEnvironment input, and allows the validation method to return specific data for the runJob method.  See the [WordCountExample](job-server-tests/src/main/scala/spark/jobserver/WordCountExample.scala) and [LongPiJob](job-server-tests/src/main/scala/spark/jobserver/LongPiJob.scala) for examples.
 
 Let's try running our sample job with an invalid configuration:
 
@@ -605,7 +606,7 @@ By default, H2 database is used for storing Spark Jobserver related meta data.
 This can be overridden if you prefer to use PostgreSQL or MySQL.
 It is also important that any dependent jars are to be added to Job Server class path.
 
-To use embedded H2 as backend add the following configuration to local.conf.
+To use the embedded H2 db as a backend, add the following configuration to local.conf.
 
     spark {
       jobserver {
@@ -640,16 +641,28 @@ To use embedded H2 as backend add the following configuration to local.conf.
 If you are using `context-per-jvm = true`, be sure to add [AUTO_MIXED_MODE](http://h2database.com/html/features.html#auto_mixed_mode) to your
 H2 JDBC URL; this allows multiple processes to share the same H2 database using a lock file.
 
-In a yarn-client mode if using H2 the below is advised.
-- Run H2 in server mode (http://www.h2database.com/html/download.html, and follow docs.,)
-Jdbc configuration should be like below:
+In yarn-client mode, use H2 in server mode as described below instead of embedded mode.
+- Download the full H2 jar from http://www.h2database.com/html/download.html and follow docs.
+- Note that the version of H2 should match the H2 client version bundled with spark-jobserver, currently 1.3.176.
+
+
+A sample JDBC configuration is below:
 ```
 jdbc {
-        url = "jdbc:h2:tcp://localhost/db_host/spark_jobserver"
+        url = "jdbc:h2:tcp://localhost//ROOT/PARENT/DIRECTORIES/spark_jobserver"
         user = "secret"
         password = "secret"
       }
+
 ```
+Note: /ROOT/PARENT/DIRECTORIES/spark_jobserver is the absolute path to a directory to which H2 has write access.
+
+
+Example command line to launch H2 Server:
+```
+java -cp h2-1.3.176.jar org.h2.tools.Server -tcp
+```
+Use -? on command line to see other options.
 
 #### Configuring Spark Jobserver PostgreSQL Database backend
 Ensure that you have spark_jobserver database created with necessary rights
