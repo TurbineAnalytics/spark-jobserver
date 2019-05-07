@@ -88,10 +88,7 @@ export SPARK_HOME
 export YARN_CONF_DIR
 export HADOOP_CONF_DIR
 
-GC_OPTS_BASE="-XX:+UseConcMarkSweepGC
-         -verbose:gc -XX:+PrintGCTimeStamps
-         -XX:MaxPermSize=512m
-         -XX:+CMSClassUnloadingEnabled "
+GC_OPTS_BASE="-XX:+UseG1GC -XX:+PrintFlagsFinal -XX:+PrintReferenceGC -verbose:gc -XX:+PrintGCDetails -XX:+PrintGCTimeStamps -XX:+PrintAdaptiveSizePolicy -XX:+UnlockDiagnosticVMOptions -XX:+G1SummarizeConcMark "
 
 JAVA_OPTS_BASE="-XX:MaxDirectMemorySize=$MAX_DIRECT_MEMORY
          -XX:+HeapDumpOnOutOfMemoryError -Djava.net.preferIPv4Stack=true"
